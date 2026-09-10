@@ -12,7 +12,6 @@ Set a profile photo from the avatar menu, top-right.
 ## Run it
 
 ```bash
-cd "/Users/tommy/Desktop/WK project"
 node server.js
 ```
 
@@ -63,6 +62,92 @@ node test.js       # or: npm test
 
 Boots the server against a throwaway data directory on port 4199 and runs an
 end-to-end API check (auth, CRUD, config, CSV, audit, backups). Exit code 0 = all green.
+
+## Where the data lives
+
+Two backends, chosen by whether `WK_DATABASE_URL` is set:
+
+| | JSON files (default) | Postgres |
+|---|---|---|
+| When | local use, and any host with a real disk | anywhere, including hosts with no persistent storage |
+| Data | `data/*.json` under `WK_DATA_DIR` | the `wk` schema |
+| Dependencies | none at all | `pg` — `npm install` |
+| Avatars / invite previews | files under `public/` | rows, so they survive a deploy |
+
+Nothing else changes: the app reads everything into memory at boot and serves
+requests from there either way, so the two behave identically.
+
+**Postgres, in practice.** Point `WK_DATABASE_URL` at the database and start the
+server — it creates its own schema and tables on first boot and seeds itself.
+Everything lives in a schema called `wk`, deliberately not `public`: Supabase
+exposes `public` through its REST API, where the publishable key would be enough
+to read the users table, and that table holds password hashes. Row-level
+security is switched on as a second lock.
+
+The connection string can also go in `.env` next to `server.js`, which is
+git-ignored — handy for not repeating a password on the command line.
+
+To check a connection string before trusting it to a deploy:
+
+```bash
+WK_DATABASE_URL="postgresql://..." npm run test:pg
+```
+
+That runs the full API against a throwaway `wk_test` schema, restarts the server
+mid-test to prove the data is really in the database, and drops the schema after.
+
+### Moving an existing file install into Postgres
+
+```bash
+WK_DATABASE_URL="postgresql://..." npm run import -- /path/to/data
+```
+
+Copies bookings, accounts (password hashes included, so everyone keeps their
+password), field config, the activity log, avatars and the session key. It stops
+rather than overwrite a database that already has bookings; add `--replace` if
+that is genuinely what you want.
+
+### Supabase connection strings
+
+Use the **session pooler** string, not "Direct connection". Supabase's direct
+host (`db.<ref>.supabase.co`) resolves to IPv6 only, and most hosts — Render
+included — have IPv4-only outbound, so a direct connection simply cannot be
+reached. The pooler host (`aws-<n>-<region>.pooler.supabase.com`, port 5432)
+has an IPv4 address and behaves like an ordinary Postgres connection.
+
+Find it in Supabase under **Connect → Session pooler**.
+
+### Deploying it on its own domain
+
+With `WK_DATABASE_URL` set the app writes nothing to disk, so it runs on any
+host with no persistent storage attached — a plain Node web service is enough.
+
+- **Build command:** `npm install`
+- **Start command:** `npm start`
+- **Port:** the app listens on `$PORT` when the host sets one (most do), else 4173.
+
+Then set:
+
+| Variable | Value | Why |
+|---|---|---|
+| `WK_DATABASE_URL` | the Supabase **session pooler** string, with the password filled in | Where everything is stored. Without it the app falls back to JSON files, which a host with no disk wipes on every deploy. |
+| `WK_APP_URL` | the app's public URL, e.g. `https://bookings.example.com` | the link inside invitation emails |
+| `WK_ADMIN_CONTACT` | an email address | the "Contact your admin" link on the sign-in screen |
+| `WK_ADMIN_PASSWORD` | a strong password | read **only on the very first run**, to create the first admin. Leave it unset and the server prints a random one to the log instead. |
+| `WK_SECURE_COOKIES` | `1` | **Set this whenever the app is behind HTTPS.** See below. |
+| `WK_SMTP_HOST` / `_USER` / `_PASS` / `_FROM` | your mail provider | without these, invites show the temp password on screen instead of emailing it |
+
+**About `WK_SECURE_COOKIES`.** The session cookie is marked `Secure` — meaning
+the browser will only ever send it over HTTPS — whenever this server terminates
+TLS itself (`WK_TLS_CERT` / `WK_TLS_KEY`). Hosted behind a load balancer or CDN,
+TLS is terminated *there* and this process only ever sees plain HTTP, so it
+cannot tell and leaves the flag off. `WK_SECURE_COOKIES=1` says "there is HTTPS
+in front of you" and puts it back. Without it, a visit over plain `http://`
+would send the session cookie in the clear.
+
+**A note on scaling.** The app holds its data in memory and writes changes
+through to the database, so run **one instance**. Two instances would each have
+their own copy and quietly overwrite each other.
 
 ## Signing in
 
