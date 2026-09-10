@@ -1,7 +1,11 @@
 # weKnow Staff Bookings
 
-A local Gantt-style staff booking system for weKnow — table + timeline views,
-full create / edit / delete, drag-to-reschedule, filters, light/dark.
+A Gantt-style staff booking system for weKnow — table + timeline views, full
+create / edit / delete, drag-to-reschedule, filters, light/dark.
+
+Runs on your laptop with nothing installed, storing data in JSON files; point it
+at a Postgres database instead and the same app runs as a shared, hosted tool
+that writes nothing to disk. See [Where the data lives](#where-the-data-lives).
 
 Opens in the **Table** view. The **Timeline** is a day-by-day Gantt (month + day
 header, weekends shaded); **click a month name** to zoom it to fill the screen,
@@ -20,7 +24,9 @@ Then open **http://localhost:4173** in Chrome.
 - Change the port: `PORT=5000 node server.js`
 - Stop it: `Ctrl+C` in the terminal
 
-No `npm install` needed — the server has zero dependencies (plain Node ≥ 18).
+No `npm install` needed to run it on files — the server has no dependencies of
+its own (plain Node ≥ 18). Storing data in Postgres instead pulls in exactly one
+package, `pg`; see [Where the data lives](#where-the-data-lives).
 
 ### Configuration — `.env`
 
@@ -47,21 +53,31 @@ Session cookies are automatically marked `Secure` when TLS is on.
 
 ### Backups &amp; activity log
 
-- Every change **snapshots the previous `bookings.json` / `config.json` / `users.json`**
-  into `data/backups/` (at most one snapshot per file per 5 min, newest 40 kept).
-  To restore: stop the server, copy a snapshot back over the live file, start again.
+Both work the same either way; only where they land differs.
+
+- Every change **snapshots the previous bookings / config / users** before
+  overwriting them — at most one snapshot per collection per 5 min, newest 40
+  kept. On files that is `data/backups/`; on Postgres it is the `wk.backups`
+  table. To restore from a file snapshot: stop the server, copy it back over the
+  live file, start again.
 - Sign-ins, edits, deletes, invites and field changes are appended to
-  `data/audit.log` (one JSON object per line). Admins can read the last 300
-  entries from **Tools ▾ → Activity**.
+  `data/audit.log` (one JSON object per line) or the `wk.audit` table. Admins can
+  read the last 300 entries from **Tools ▾ → Activity**.
 
 ### Test it
 
 ```bash
-node test.js       # or: npm test
+npm test                                              # the file backend
+WK_DATABASE_URL="postgresql://..." npm run test:pg    # the Postgres backend
 ```
 
-Boots the server against a throwaway data directory on port 4199 and runs an
-end-to-end API check (auth, CRUD, config, CSV, audit, backups). Exit code 0 = all green.
+`npm test` boots the server against a throwaway data directory on port 4199 and
+runs an end-to-end API check (auth, CRUD, config, CSV, audit, backups).
+
+`npm run test:pg` does the same against a database, in a throwaway `wk_test`
+schema it drops afterwards — safe to point at the real one. It also restarts the
+server mid-run to prove the data is genuinely in the database and not just in
+memory. Exit code 0 = all green.
 
 ## Where the data lives
 
@@ -163,9 +179,11 @@ in `.env` (or the environment) before the first run.
 Set `WK_ADMIN_CONTACT` to an email address and it shows up on the sign-in screen
 as the "Contact your admin" link for access / password-reset help.
 
-- Accounts live in `data/users.json` (passwords are scrypt-hashed, never stored plain).
+- Accounts live in `data/users.json`, or the `wk.users` table on Postgres.
+  Passwords are scrypt-hashed, never stored plain.
 - Sessions are signed cookies (12 h, or 30 days with *Keep me signed in*); the
-  signing key is `data/.session-secret`.
+  signing key is `data/.session-secret`, or a row in `wk.state`. Either way it
+  outlives a restart, so nobody is logged out by a deploy.
 - Every `/api/*` call except the login endpoints requires a valid session.
 - Sign out / change your password from the avatar menu, top-right.
 
@@ -229,7 +247,8 @@ node server.js
 - Typing a brand-new client / role / delivery manager straight into a booking
   also adds it to the list automatically.
 
-Everything here lives in `data/config.json`.
+Everything here is stored as one config document — `data/config.json`, or the
+`config` row of `wk.state` on Postgres.
 
 ## Table view — works like a spreadsheet
 
@@ -242,16 +261,23 @@ Everything here lives in `data/config.json`.
 
 ## How it works
 
-| Piece | File |
-|---|---|
-| HTTP server + REST API + static hosting | `server.js` |
-| The app (UI, all in one file) | `public/index.html` |
-| Your bookings (created on first run) | `data/bookings.json` |
-| Field options — statuses, clients, roles, delivery managers | `data/config.json` |
-| User accounts (scrypt-hashed passwords) | `data/users.json` |
-| Automatic point-in-time snapshots | `data/backups/` |
-| Activity log (sign-ins, edits, invites…) | `data/audit.log` |
-| Smoke test | `test.js` |
+| Piece | Code | On files | On Postgres |
+|---|---|---|---|
+| HTTP server + REST API + static hosting | `server.js` | | |
+| The app (UI, all in one file) | `public/index.html` | | |
+| Postgres backend (schema, queries) | `store-pg.js` | — | |
+| Your bookings (created on first run) | | `data/bookings.json` | `wk.bookings` |
+| Field options — statuses, clients, roles, delivery managers | | `data/config.json` | `wk.state` |
+| User accounts (scrypt-hashed passwords) | | `data/users.json` | `wk.users` |
+| Automatic point-in-time snapshots | | `data/backups/` | `wk.backups` |
+| Activity log (sign-ins, edits, invites…) | | `data/audit.log` | `wk.audit` |
+| Avatars and invite previews | | `public/avatars/`, `public/invites/` | `wk.assets` |
+| Smoke tests | `test.js`, `test-pg.js` | | |
+| Move files into Postgres | `import-files.js` | | |
+
+The app reads everything into memory at boot and writes changes through to
+storage, so **run one instance**. Two would each hold their own copy and
+overwrite each other.
 | Configuration | `.env` (see `.env.example`) |
 
 The browser talks to a small JSON API:
@@ -279,9 +305,10 @@ PATCH  /api/team/:id          {role} / {status}  (admin)
 DELETE /api/team/:id          remove member (admin)
 ```
 
-Every change is written to `data/bookings.json`. Open the app in several tabs or
-on other machines on your network (`http://<your-ip>:4173`) — each tab refreshes
-from the server every 7 seconds, so edits show up for everyone.
+Every change is written straight through to storage. Open the app in several tabs
+or on other machines (`http://<your-ip>:4173` on a local network, or its public
+URL) — each tab refreshes from the server every 7 seconds, so edits show up for
+everyone.
 
 ## Booking fields
 
@@ -302,11 +329,23 @@ to `Risk` / `Exit` / `N/A` on server start.
 
 ## Reset / import data
 
+**On files:**
+
 - **Reset to the sample set:** stop the server, delete `data/bookings.json`, start again.
 - **Import your real data:** stop the server, replace `data/bookings.json` with an
   array of booking objects (same field names as above; `id` optional), start again.
 - **Restore a backup:** stop the server, copy a file out of `data/backups/` over
   the live one (drop the timestamp from the name), start again.
+
+**On Postgres:**
+
+- **Move an existing file install in:** `npm run import -- /path/to/data` — see
+  [Moving an existing file install into Postgres](#moving-an-existing-file-install-into-postgres).
+- **Reset to the sample set:** `delete from wk.bookings;` then restart the server;
+  it re-seeds when it finds the table empty.
+- **Restore a backup:** the snapshots are JSON documents in `wk.backups`, newest
+  first — `select payload from wk.backups where name = 'bookings' order by id desc limit 1;`
+  Write it back with `import-files.js`, or paste it over `wk.bookings` by hand.
 
 ## Not built yet
 
