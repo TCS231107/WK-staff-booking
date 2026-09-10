@@ -33,6 +33,28 @@ const ROOT = __dirname;
 })();
 
 const PORT = process.env.PORT || 4173;
+// Storage backend. With WK_DATABASE_URL set, everything lives in Postgres and
+// nothing is written to disk, so the app can run on a host with no persistent
+// storage. Without it, the JSON files under DATA_DIR are used exactly as before.
+const DATABASE_URL = process.env.WK_DATABASE_URL || '';
+const USE_PG = !!DATABASE_URL;
+const store = USE_PG ? require('./store-pg') : null;
+// Saves are fire-and-forget - the in-memory copy is what serves requests - so a
+// failing database has to be loud rather than silent.
+function writeFailed(what) {
+  return (err) => console.error('  ! could not save ' + what + ' to Postgres: ' + ((err && err.message) || err));
+}
+// ...and a save that is still in flight has to finish before the process goes
+// away. A host restarts this app on every deploy, and losing whatever someone
+// saved in the last moment before that is not acceptable.
+const inFlightWrites = new Set();
+function tracked(promise, what) {
+  const p = Promise.resolve(promise)
+    .catch(writeFailed(what))
+    .finally(() => inFlightWrites.delete(p));
+  inFlightWrites.add(p);
+  return p;
+}
 // Mount point. Empty => the app owns the whole origin (standalone, as before).
 // Set WK_BASE_PATH=/staff to serve it under weknowinc.com/staff behind the
 // main Next.js site; the prefix is stripped from requests and pushed back into
@@ -68,11 +90,18 @@ const BACKUP_KEEP = 40;
 const backupLast = {};
 function backupFile(file) {
   try {
-    if (!fs.existsSync(file)) return;
+    if (!USE_PG && !fs.existsSync(file)) return;
     const name = path.basename(file).replace(/\.json$/, '');
     const now = Date.now();
     if (backupLast[name] && now - backupLast[name] < 5 * 60 * 1000) return; // at most one snapshot / 5 min / file
     backupLast[name] = now;
+    if (USE_PG) {
+      // Snapshot the in-memory copy, which is what the file backend would be
+      // copying off disk at this same point.
+      const payload = name === 'bookings' ? db() : name === 'users' ? loadUsers() : loadConfig();
+      tracked(store.snapshot(name, payload), 'a ' + name + ' backup');
+      return;
+    }
     if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     fs.copyFileSync(file, path.join(BACKUP_DIR, name + '.' + stamp + '.json'));
@@ -84,9 +113,10 @@ function backupFile(file) {
 // --- append-only audit trail (one JSON object per line) ---
 function audit(action, actor, detail) {
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     const rec = { t: new Date().toISOString(), action: action, actor: actor || null };
     if (detail && typeof detail === 'object') Object.assign(rec, detail);
+    if (USE_PG) { tracked(store.appendAudit(rec), 'an activity log entry'); return; }
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.appendFile(AUDIT_FILE, JSON.stringify(rec) + '\n', () => {});
   } catch (e) {}
 }
@@ -181,7 +211,16 @@ function autoColor(name) {
 }
 
 // ---------------------------------------------------------------- storage
-function ensureData() {
+async function ensureData() {
+  if (USE_PG) {
+    // cache was filled by preload(); an empty database is a first run.
+    if (!cache.length) {
+      cache = SEED.map((b) => normalize(b, genId()));
+      await store.saveBookings(cache);
+      console.log('Seeded ' + cache.length + ' bookings -> Postgres');
+    }
+    return;
+  }
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(DATA_FILE)) {
     const seeded = SEED.map((b) => normalize(b, genId()));
@@ -195,23 +234,41 @@ function load() {
 }
 let saveTimer = null;
 let cache = null;
+let pendingSave = null;   // written but not yet flushed - see flushPendingSave()
 function save(list) {
   cache = list;
   backupFile(DATA_FILE);
+  pendingSave = list;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    saveTimer = null;
+    pendingSave = null;
+    if (USE_PG) { tracked(store.saveBookings(list), 'bookings'); return; }
     fs.writeFile(DATA_FILE, JSON.stringify(list, null, 2), (err) => {
       if (err) console.error('write failed', err);
     });
   }, 60);
 }
+// Writes are debounced, so a shutdown that lands inside that window would drop
+// the most recent change. Called before the process exits.
+function flushPendingSave() {
+  if (!pendingSave) return;
+  const list = pendingSave;
+  pendingSave = null;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (USE_PG) tracked(store.saveBookings(list), 'bookings');
+  else try { fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2)); } catch (e) { console.error('write failed', e); }
+}
 function db() { return cache || (cache = load()); }
 
 // --- config ---
 let configCache = null;
+let configLoaded = false;   // Postgres: did a stored config exist at boot?
 function loadConfig() {
   if (configCache) return configCache;
-  try { configCache = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
+  if (USE_PG) configCache = defaultConfig();       // preload() fills this first
+  else try { configCache = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
   catch (e) { configCache = defaultConfig(); }
   if (!Array.isArray(configCache.fields) || !configCache.fields.length) {
     configCache.fields = defaultConfig().fields;
@@ -222,12 +279,14 @@ function loadConfig() {
 function saveConfig(cfg) {
   configCache = cfg;
   backupFile(CONFIG_FILE);
+  if (USE_PG) { tracked(store.saveState('config', cfg), 'the field configuration'); return; }
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
 function ensureConfig() {
-  if (fs.existsSync(CONFIG_FILE)) {
+  if (USE_PG ? configLoaded : fs.existsSync(CONFIG_FILE)) {
     let raw = {};
-    try { raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
+    if (USE_PG) raw = configCache || {};
+    else try { raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
     const cfg = loadConfig();
     let dirty = !Array.isArray(raw.fields) || !raw.fields.length || !Array.isArray(raw.employees);
     // migrate the primary field label to "Employee" (once)
@@ -312,6 +371,13 @@ function isoToday() {
 let secretCache = null;
 function sessionSecret() {
   if (secretCache) return secretCache;
+  if (USE_PG) {
+    // preload() sets this. Reaching here means the boot read failed, so mint a
+    // throwaway rather than run unsigned - it only costs everyone a re-login.
+    secretCache = crypto.randomBytes(32).toString('hex');
+    tracked(store.saveState('session_secret', secretCache), 'the session key');
+    return secretCache;
+  }
   try { secretCache = fs.readFileSync(SECRET_FILE, 'utf8').trim(); }
   catch (e) { secretCache = crypto.randomBytes(32).toString('hex'); try { fs.writeFileSync(SECRET_FILE, secretCache, { mode: 0o600 }); } catch (x) {} }
   return secretCache;
@@ -335,7 +401,8 @@ function makeUser(username, pw, extra) {
 let usersCache = null;
 function loadUsers() {
   if (usersCache) return usersCache;
-  try { usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
+  if (USE_PG) usersCache = [];                     // preload() fills this first
+  else try { usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
   catch (e) { usersCache = []; }
   usersCache.forEach((u) => {
     if (!u.status) u.status = 'active';
@@ -343,22 +410,32 @@ function loadUsers() {
   });
   return usersCache;
 }
-function saveUsers() { backupFile(USERS_FILE); fs.writeFileSync(USERS_FILE, JSON.stringify(loadUsers(), null, 2), { mode: 0o600 }); }
+function saveUsers() {
+  backupFile(USERS_FILE);
+  if (USE_PG) { tracked(store.saveUsers(loadUsers()), 'the team roster'); return; }
+  fs.writeFileSync(USERS_FILE, JSON.stringify(loadUsers(), null, 2), { mode: 0o600 });
+}
 function findUser(username) {
   const uname = String(username || '').trim().toLowerCase();
   return loadUsers().find((x) => x.username.toLowerCase() === uname);
 }
-function ensureUsers() {
-  if (fs.existsSync(USERS_FILE)) { loadUsers(); return; }
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+async function ensureUsers() {
+  if (USE_PG ? loadUsers().length : fs.existsSync(USERS_FILE)) { loadUsers(); return; }
   const pw = process.env.WK_ADMIN_PASSWORD || crypto.randomBytes(6).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
   const users = [makeUser('admin', pw, { name: 'weKnow Admin', email: adminContact() || 'admin@weknowinc.com', role: 'admin' })];
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), { mode: 0o600 });
   usersCache = users;
+  if (USE_PG) {
+    // Awaited, unlike ordinary saves: if the first admin doesn't reach the
+    // database, nobody can ever sign in and the printed password is a lie.
+    await store.saveUsers(users);
+  } else {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), { mode: 0o600 });
+  }
   const line = '  Sign-in ready   username: admin   password: ' + pw + '  ';
   const bar = '  ' + '-'.repeat(line.length - 4) + '  ';
   console.log('\n' + bar + '\n' + line + '\n' + bar);
-  console.log('  Change it in data/users.json, or set WK_ADMIN_PASSWORD before first run.\n');
+  console.log('  Change it from the avatar menu after signing in, or set WK_ADMIN_PASSWORD before first run.\n');
 }
 function publicUser(u) {
   return {
@@ -471,10 +548,17 @@ async function handleAuth(req, res, sub, ip) {
       const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
       const buf = Buffer.from(m[2], 'base64');
       if (buf.length > 400 * 1024) return sendJson(res, 400, { error: 'Image is too large (max ~400 KB after resizing).' });
-      try { if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true }); } catch (e) {}
       const base = crypto.createHash('sha1').update(u.username).digest('hex').slice(0, 12);
-      ['png', 'jpg', 'webp'].forEach((x) => { try { fs.unlinkSync(path.join(AVATAR_DIR, base + '.' + x)); } catch (e) {} });
-      fs.writeFileSync(path.join(AVATAR_DIR, base + '.' + ext), buf);
+      if (USE_PG) {
+        // Stored as a row, not a file: a disk-less host loses anything written
+        // to public/ on the next deploy.
+        await store.deleteAssets(['png', 'jpg', 'webp'].map((x) => '/avatars/' + base + '.' + x));
+        await store.putAsset('/avatars/' + base + '.' + ext, 'image/' + m[1], buf);
+      } else {
+        try { if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true }); } catch (e) {}
+        ['png', 'jpg', 'webp'].forEach((x) => { try { fs.unlinkSync(path.join(AVATAR_DIR, base + '.' + x)); } catch (e) {} });
+        fs.writeFileSync(path.join(AVATAR_DIR, base + '.' + ext), buf);
+      }
       u.avatar = BASE_PATH + '/avatars/' + base + '.' + ext + '?v=' + Date.now();
       saveUsers();
       audit('auth.avatar_set', u.username, {});
@@ -588,10 +672,15 @@ async function handleTeam(req, res, parts, me) {
 // write the invite email to a preview file and send it if SMTP is configured
 async function deliverInvite(u, pw, inviter, baseUrl) {
   const html = renderInviteEmail({ name: u.name, email: u.email, tempPassword: pw, inviterName: inviter.name || inviter.username, appUrl: baseUrl });
-  const dir = path.join(PUBLIC_DIR, 'invites');
-  try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   const file = (u.inviteToken || inviteToken()) + '.html';
-  try { fs.writeFileSync(path.join(dir, file), html); } catch (e) {}
+  if (USE_PG) {
+    await store.putAsset('/invites/' + file, 'text/html; charset=utf-8', Buffer.from(html, 'utf8'))
+      .catch(writeFailed('the invitation preview'));
+  } else {
+    const dir = path.join(PUBLIC_DIR, 'invites');
+    try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+    try { fs.writeFileSync(path.join(dir, file), html); } catch (e) {}
+  }
   const previewUrl = baseUrl + '/invites/' + file;
   const smtp = smtpConfig();
   let sent = false, error = null;
@@ -756,6 +845,15 @@ function rebaseHtml(buf) {
 function serveStatic(req, res) {
   let rel = decodeURIComponent(req.url.split('?')[0]);
   if (rel === '/') rel = '/index.html';
+  // Avatars and invite previews are rows in Postgres, not files on disk.
+  if (USE_PG && (rel.indexOf('/avatars/') === 0 || rel.indexOf('/invites/') === 0)) {
+    store.getAsset(rel).then((asset) => {
+      if (!asset) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found'); return; }
+      res.writeHead(200, { 'Content-Type': asset.mime, 'Cache-Control': 'no-store, must-revalidate' });
+      res.end(asset.bytes);
+    }).catch(() => { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end('Storage error'); });
+    return;
+  }
   const filePath = path.join(PUBLIC_DIR, path.normalize(rel));
   if (!filePath.startsWith(PUBLIC_DIR)) { sendJson(res, 403, { error: 'forbidden' }); return; }
   fs.readFile(filePath, (err, buf) => {
@@ -979,9 +1077,10 @@ function exportCsv(req, res, me) {
 }
 
 // ---------------------------------------------------------------- audit read (admins)
-function handleAudit(req, res, me) {
+async function handleAudit(req, res, me) {
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
   if (me.role !== 'admin') return sendJson(res, 403, { error: 'Only administrators can view the activity log.' });
+  if (USE_PG) return sendJson(res, 200, { events: await store.readAudit(300) });
   let lines = [];
   try { lines = fs.readFileSync(AUDIT_FILE, 'utf8').trim().split(/\n/); } catch (e) {}
   const out = [];
@@ -993,21 +1092,32 @@ function handleAudit(req, res, me) {
 }
 
 // ---------------------------------------------------------------- boot
-ensureUsers();
-ensureData();
+// Postgres: read every collection once and hand it to the same in-memory caches
+// the file backend fills, so nothing downstream knows where the data came from.
+async function preload() {
+  cache = await store.loadBookings();
+  usersCache = await store.loadUsers();
+  const cfg = await store.loadState('config');
+  if (cfg) { configCache = cfg; configLoaded = true; }
+  const secret = await store.loadState('session_secret');
+  if (secret) {
+    secretCache = secret;
+  } else {
+    secretCache = crypto.randomBytes(32).toString('hex');
+    await store.saveState('session_secret', secretCache);
+  }
+}
 
-(function migrateStatuses() {
-  const list = load();
+async function migrateStatuses() {
+  const list = USE_PG ? db() : load();
   let changed = false;
   list.forEach((b) => { if (STATUS_LEGACY[b.status]) { b.status = STATUS_LEGACY[b.status]; changed = true; } });
   if (changed) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2));
+    if (USE_PG) await store.saveBookings(list);
+    else fs.writeFileSync(DATA_FILE, JSON.stringify(list, null, 2));
     console.log('Migrated legacy status values (At risk -> Risk, Rolling off -> Exit, On hold -> N/A)');
   }
-})();
-
-db();
-ensureConfig();
+}
 
 // Strip the mount prefix so every route below sees the paths it always saw.
 // Tolerates the proxy passing the prefix through ("/staff/api/x") or stripping
@@ -1032,14 +1142,70 @@ const requestHandler = (req, res) => {
 const server = TLS_OPTS ? https.createServer(TLS_OPTS, requestHandler) : http.createServer(requestHandler);
 const scheme = TLS_OPTS ? 'https' : 'http';
 
-server.listen(PORT, BIND, () => {
-  console.log('\n  weKnow Staff Bookings');
-  console.log('  ---------------------');
-  console.log('  Running at  ' + scheme + '://' + (BIND === '0.0.0.0' ? 'localhost' : BIND) + ':' + PORT + BASE_PATH + (TLS_OPTS ? '   (TLS)' : ''));
-  if (BASE_PATH) console.log('  Mounted at  ' + BASE_PATH + '   (behind the weknowinc.com Next.js site)');
-  console.log('  Data dir    ' + DATA_DIR);
-  console.log('  Backups     ' + BACKUP_DIR + '   (auto, keeps ' + BACKUP_KEEP + ')');
-  console.log('  Activity    ' + AUDIT_FILE);
-  if (!smtpConfig()) console.log('  Email       not configured - invites show the temp password on screen');
-  console.log('  Stop with   Ctrl+C\n');
+async function start() {
+  if (USE_PG) {
+    await store.init(DATABASE_URL);
+    await preload();
+  }
+  await ensureUsers();
+  await ensureData();
+  await migrateStatuses();
+  db();
+  ensureConfig();
+
+  server.listen(PORT, BIND, () => {
+    console.log('\n  weKnow Staff Bookings');
+    console.log('  ---------------------');
+    console.log('  Running at  ' + scheme + '://' + (BIND === '0.0.0.0' ? 'localhost' : BIND) + ':' + PORT + BASE_PATH + (TLS_OPTS ? '   (TLS)' : ''));
+    if (BASE_PATH) console.log('  Mounted at  ' + BASE_PATH + '   (behind the weknowinc.com Next.js site)');
+    if (USE_PG) {
+      console.log('  Storage     Postgres, schema "' + store.SCHEMA + '"   (nothing is written to disk)');
+      console.log('  Backups     ' + store.SCHEMA + '.backups   (auto, keeps ' + BACKUP_KEEP + ' per collection)');
+      console.log('  Activity    ' + store.SCHEMA + '.audit');
+    } else {
+      console.log('  Data dir    ' + DATA_DIR);
+      console.log('  Backups     ' + BACKUP_DIR + '   (auto, keeps ' + BACKUP_KEEP + ')');
+      console.log('  Activity    ' + AUDIT_FILE);
+    }
+    if (!smtpConfig()) console.log('  Email       not configured - invites show the temp password on screen');
+    console.log('  Stop with   Ctrl+C\n');
+  });
+}
+
+// Deploys and Ctrl+C both arrive as a signal: stop taking requests, get the
+// last write safely into storage, then go.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('\n  ' + signal + ' received - finishing pending writes...');
+  try { server.close(); } catch (e) {}
+  // Never hang a deploy: take the time needed, but not indefinitely.
+  const deadline = new Promise((r) => setTimeout(r, 8000));
+  try {
+    flushPendingSave();
+    await Promise.race([
+      (async () => {
+        while (inFlightWrites.size) await Promise.all([...inFlightWrites]);
+      })(),
+      deadline
+    ]);
+    if (USE_PG) await Promise.race([store.close(), deadline]);
+  } catch (e) {
+    console.error('  ! shutdown: ' + ((e && e.message) || e));
+  }
+  console.log('  done.\n');
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+start().catch((e) => {
+  console.error('\n  Could not start weKnow Staff Bookings:\n  ' + ((e && e.message) || e) + '\n');
+  if (USE_PG) {
+    console.error('  Check WK_DATABASE_URL. Supabase direct connections (db.<ref>.supabase.co)');
+    console.error('  are IPv6-only; on an IPv4-only host use the session pooler connection');
+    console.error('  string instead (aws-<n>-<region>.pooler.supabase.com, port 5432).\n');
+  }
+  process.exit(1);
 });

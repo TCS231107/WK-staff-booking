@@ -101,13 +101,64 @@ pieces that make `/staff` work:
 The app binds to `127.0.0.1`, so it is reachable only through the site — there is
 no second public port and no second certificate.
 
+## Where the data lives
+
+Two backends, chosen by whether `WK_DATABASE_URL` is set:
+
+| | JSON files (default) | Postgres |
+|---|---|---|
+| When | local use, and any host with a real disk | anywhere, including hosts with no persistent storage |
+| Data | `data/*.json` under `WK_DATA_DIR` | the `wk` schema |
+| Dependencies | none at all | `pg` (already in the site's `package.json`) |
+| Avatars / invite previews | files under `public/` | rows, so they survive a deploy |
+
+Nothing else changes: the app reads everything into memory at boot and serves
+requests from there either way, so the two behave identically.
+
+**Postgres, in practice.** Point `WK_DATABASE_URL` at the database and start the
+server — it creates its own schema and tables on first boot and seeds itself.
+Everything lives in a schema called `wk`, deliberately not `public`: Supabase
+exposes `public` through its REST API, where the publishable key would be enough
+to read the users table, and that table holds password hashes. Row-level
+security is switched on as a second lock.
+
+To check a connection string before trusting it to a deploy:
+
+```bash
+WK_DATABASE_URL="postgresql://..." npm run staff:test:pg
+```
+
+That runs the full API against a throwaway `wk_test` schema, restarts the server
+mid-test to prove the data is really in the database, and drops the schema after.
+
+### Moving an existing file install into Postgres
+
+```bash
+WK_DATABASE_URL="postgresql://..." npm run staff:import -- /path/to/data
+```
+
+Copies bookings, accounts (password hashes included, so everyone keeps their
+password), field config, the activity log, avatars and the session key. It stops
+rather than overwrite a database that already has bookings; add `--replace` if
+that is genuinely what you want.
+
+### Supabase connection strings
+
+Use the **session pooler** string, not "Direct connection". Supabase's direct
+host (`db.<ref>.supabase.co`) resolves to IPv6 only, and most hosts — Render
+included — have IPv4-only outbound, so a direct connection simply cannot be
+reached. The pooler host (`aws-<n>-<region>.pooler.supabase.com`, port 5432)
+has an IPv4 address and behaves like an ordinary Postgres connection.
+
+Find it in Supabase under **Connect → Session pooler**.
+
 ### Deploying
 
 Set these on the service (Render → Environment):
 
 | Variable | Value | Why |
 |---|---|---|
-| `WK_DATA_DIR` | a path on a **persistent disk**, e.g. `/var/data/staff` | **Required.** Bookings, accounts and the session key are files. On an ephemeral filesystem every deploy wipes them and everyone is logged out. |
+| `WK_DATABASE_URL` | the Supabase **session pooler** string, with the password filled in | Where everything is stored. Without it the app falls back to files, which a host with no disk wipes on every deploy. |
 | `WK_APP_URL` | `https://weknowinc.com/staff` | the link inside invitation emails |
 | `WK_ADMIN_CONTACT` | `it@weknowinc.com` | the "Contact your admin" link on the sign-in screen |
 | `WK_ADMIN_PASSWORD` | a strong password | read **only on the very first run**, to create the first admin. Leave it unset and the server prints a random one to the deploy log instead. |
@@ -115,6 +166,10 @@ Set these on the service (Render → Environment):
 
 `WK_SECURE_COOKIES=1` is set for you in production by the start script, because
 TLS terminates at Cloudflare and the session cookie still has to be `Secure`.
+
+With `WK_DATABASE_URL` set, this app writes nothing to disk and the service needs
+no persistent disk — which also keeps the site's zero-downtime deploys, since a
+Render service with a disk gives those up.
 
 To move this app to its own service later, point `STAFF_ORIGIN` at it (e.g.
 `https://bookings.internal`) — the site proxies there instead and stops starting
