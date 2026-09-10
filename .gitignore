@@ -1,0 +1,16 @@
+node_modules/
+.claude/
+.DS_Store
+.env
+
+# Runtime data (created on first run)
+data/bookings.json
+data/config.json
+data/users.json
+data/.session-secret
+data/audit.log
+data/backups/
+
+# Per-user uploads and generated invite emails
+public/invites/
+public/avatars/

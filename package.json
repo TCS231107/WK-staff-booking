@@ -1,0 +1,14 @@
+{
+  "name": "weknow-staff-bookings",
+  "version": "1.0.0",
+  "private": true,
+  "description": "weKnow Staff Bookings — local Gantt / staff booking system",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
