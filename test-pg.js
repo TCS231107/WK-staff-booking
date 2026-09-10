@@ -18,6 +18,8 @@
 const { spawn } = require('child_process');
 const path = require('path');
 
+require('./load-env')();
+
 const PORT = process.env.TEST_PORT || 4197;
 const BASE = 'http://localhost:' + PORT;
 const ADMIN_PW = 'testpassword123';
@@ -26,7 +28,8 @@ const DATABASE_URL = process.env.WK_DATABASE_URL || '';
 
 if (!DATABASE_URL) {
   console.log('\n  WK_DATABASE_URL is not set — nothing to test against.');
-  console.log('  Run:  WK_DATABASE_URL="postgresql://..." node test-pg.js\n');
+  console.log('  Put it in staff/.env, or pass it inline:');
+  console.log('    WK_DATABASE_URL="postgresql://..." npm run staff:test:pg\n');
   process.exit(0);
 }
 

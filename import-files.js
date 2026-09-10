@@ -18,6 +18,8 @@
 const fs = require('fs');
 const path = require('path');
 
+require('./load-env')();
+
 const store = require('./store-pg');
 
 const args = process.argv.slice(2);
