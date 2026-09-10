@@ -1,7 +1,11 @@
 # weKnow Staff Bookings
 
-A local Gantt-style staff booking system for weKnow — table + timeline views,
-full create / edit / delete, drag-to-reschedule, filters, light/dark.
+A Gantt-style staff booking system for weKnow — table + timeline views, full
+create / edit / delete, drag-to-reschedule, filters, light/dark.
+
+Runs on your laptop with nothing installed, storing data in JSON files; point it
+at a Postgres database instead and the same app runs as a shared, hosted tool
+that writes nothing to disk. See [Where the data lives](#where-the-data-lives).
 
 Opens in the **Table** view. The **Timeline** is a day-by-day Gantt (month + day
 header, weekends shaded); **click a month name** to zoom it to fill the screen,
@@ -9,26 +13,10 @@ header, weekends shaded); **click a month name** to zoom it to fill the screen,
 redraws when data actually changed, so your scroll position stays put.
 Set a profile photo from the avatar menu, top-right.
 
-## Where this runs
-
-This app lives inside the weknowinc.com site repo (`staff/`) and is served at
-**https://weknowinc.com/staff**. It is still its own process — a zero-dependency
-Node server that owns its own data — and the Next.js site simply proxies `/staff`
-to it. See [Serving it under weknowinc.com/staff](#serving-it-under-weknowinccomstaff)
-for how that is wired and what to set on the server.
-
 ## Run it
 
-From the repo root, this starts the site *and* this app together:
-
 ```bash
-npm run dev     # site on :3000, bookings at http://localhost:3000/staff
-```
-
-Or run it standalone, exactly as before — no site, no proxy:
-
-```bash
-node staff/server.js
+node server.js
 ```
 
 Then open **http://localhost:4173** in Chrome.
@@ -36,7 +24,9 @@ Then open **http://localhost:4173** in Chrome.
 - Change the port: `PORT=5000 node server.js`
 - Stop it: `Ctrl+C` in the terminal
 
-No `npm install` needed — the server has zero dependencies (plain Node ≥ 18).
+No `npm install` needed to run it on files — the server has no dependencies of
+its own (plain Node ≥ 18). Storing data in Postgres instead pulls in exactly one
+package, `pg`; see [Where the data lives](#where-the-data-lives).
 
 ### Configuration — `.env`
 
@@ -63,43 +53,31 @@ Session cookies are automatically marked `Secure` when TLS is on.
 
 ### Backups &amp; activity log
 
-- Every change **snapshots the previous `bookings.json` / `config.json` / `users.json`**
-  into `data/backups/` (at most one snapshot per file per 5 min, newest 40 kept).
-  To restore: stop the server, copy a snapshot back over the live file, start again.
+Both work the same either way; only where they land differs.
+
+- Every change **snapshots the previous bookings / config / users** before
+  overwriting them — at most one snapshot per collection per 5 min, newest 40
+  kept. On files that is `data/backups/`; on Postgres it is the `wk.backups`
+  table. To restore from a file snapshot: stop the server, copy it back over the
+  live file, start again.
 - Sign-ins, edits, deletes, invites and field changes are appended to
-  `data/audit.log` (one JSON object per line). Admins can read the last 300
-  entries from **Tools ▾ → Activity**.
+  `data/audit.log` (one JSON object per line) or the `wk.audit` table. Admins can
+  read the last 300 entries from **Tools ▾ → Activity**.
 
 ### Test it
 
 ```bash
-node test.js       # or: npm test
+npm test                                              # the file backend
+WK_DATABASE_URL="postgresql://..." npm run test:pg    # the Postgres backend
 ```
 
-Boots the server against a throwaway data directory on port 4199 and runs an
-end-to-end API check (auth, CRUD, config, CSV, audit, backups). Exit code 0 = all green.
+`npm test` boots the server against a throwaway data directory on port 4199 and
+runs an end-to-end API check (auth, CRUD, config, CSV, audit, backups).
 
-## Serving it under weknowinc.com/staff
-
-The marketing site (Next.js) and this app are two processes on one host:
-
-```
-browser -> Cloudflare -> Render -> Next.js :$PORT ──/staff/*──> staff/server.js :4173 (loopback)
-                                        └─ everything else ─> the marketing site
-```
-
-`npm start` at the repo root boots both (`scripts/start-with-staff.mjs`). The
-pieces that make `/staff` work:
-
-| Where | What it does |
-|---|---|
-| `next.config.mjs` → `rewrites()` | proxies `/staff` and `/staff/*` to `STAFF_ORIGIN` |
-| `next.config.mjs` → `skipTrailingSlashRedirect` | stops Next from 308-ing every `/staff/api/*` call |
-| `src/middleware.ts` | re-implements the site's trailing-slash redirect, skipping `/staff` |
-| `WK_BASE_PATH=/staff` (this server) | strips the prefix from requests and adds it to every URL the app hands back |
-
-The app binds to `127.0.0.1`, so it is reachable only through the site — there is
-no second public port and no second certificate.
+`npm run test:pg` does the same against a database, in a throwaway `wk_test`
+schema it drops afterwards — safe to point at the real one. It also restarts the
+server mid-run to prove the data is genuinely in the database and not just in
+memory. Exit code 0 = all green.
 
 ## Where the data lives
 
@@ -109,7 +87,7 @@ Two backends, chosen by whether `WK_DATABASE_URL` is set:
 |---|---|---|
 | When | local use, and any host with a real disk | anywhere, including hosts with no persistent storage |
 | Data | `data/*.json` under `WK_DATA_DIR` | the `wk` schema |
-| Dependencies | none at all | `pg` (already in the site's `package.json`) |
+| Dependencies | none at all | `pg` — `npm install` |
 | Avatars / invite previews | files under `public/` | rows, so they survive a deploy |
 
 Nothing else changes: the app reads everything into memory at boot and serves
@@ -128,7 +106,7 @@ git-ignored — handy for not repeating a password on the command line.
 To check a connection string before trusting it to a deploy:
 
 ```bash
-cd staff && WK_DATABASE_URL="postgresql://..." npm run test:pg
+WK_DATABASE_URL="postgresql://..." npm run test:pg
 ```
 
 That runs the full API against a throwaway `wk_test` schema, restarts the server
@@ -137,7 +115,7 @@ mid-test to prove the data is really in the database, and drops the schema after
 ### Moving an existing file install into Postgres
 
 ```bash
-cd staff && WK_DATABASE_URL="postgresql://..." npm run import -- /path/to/data
+WK_DATABASE_URL="postgresql://..." npm run import -- /path/to/data
 ```
 
 Copies bookings, accounts (password hashes included, so everyone keeps their
@@ -155,40 +133,37 @@ has an IPv4 address and behaves like an ordinary Postgres connection.
 
 Find it in Supabase under **Connect → Session pooler**.
 
-### Deploying
+### Deploying it on its own domain
 
-Set these on the service (Render → Environment):
+With `WK_DATABASE_URL` set the app writes nothing to disk, so it runs on any
+host with no persistent storage attached — a plain Node web service is enough.
+
+- **Build command:** `npm install`
+- **Start command:** `npm start`
+- **Port:** the app listens on `$PORT` when the host sets one (most do), else 4173.
+
+Then set:
 
 | Variable | Value | Why |
 |---|---|---|
-| `WK_DATABASE_URL` | the Supabase **session pooler** string, with the password filled in | Where everything is stored. Without it the app falls back to files, which a host with no disk wipes on every deploy. |
-| `WK_APP_URL` | `https://weknowinc.com/staff` | the link inside invitation emails |
-| `WK_ADMIN_CONTACT` | `it@weknowinc.com` | the "Contact your admin" link on the sign-in screen |
-| `WK_ADMIN_PASSWORD` | a strong password | read **only on the very first run**, to create the first admin. Leave it unset and the server prints a random one to the deploy log instead. |
+| `WK_DATABASE_URL` | the Supabase **session pooler** string, with the password filled in | Where everything is stored. Without it the app falls back to JSON files, which a host with no disk wipes on every deploy. |
+| `WK_APP_URL` | the app's public URL, e.g. `https://bookings.example.com` | the link inside invitation emails |
+| `WK_ADMIN_CONTACT` | an email address | the "Contact your admin" link on the sign-in screen |
+| `WK_ADMIN_PASSWORD` | a strong password | read **only on the very first run**, to create the first admin. Leave it unset and the server prints a random one to the log instead. |
+| `WK_SECURE_COOKIES` | `1` | **Set this whenever the app is behind HTTPS.** See below. |
 | `WK_SMTP_HOST` / `_USER` / `_PASS` / `_FROM` | your mail provider | without these, invites show the temp password on screen instead of emailing it |
 
-`WK_SECURE_COOKIES=1` is set for you in production by the start script, because
-TLS terminates at Cloudflare and the session cookie still has to be `Secure`.
+**About `WK_SECURE_COOKIES`.** The session cookie is marked `Secure` — meaning
+the browser will only ever send it over HTTPS — whenever this server terminates
+TLS itself (`WK_TLS_CERT` / `WK_TLS_KEY`). Hosted behind a load balancer or CDN,
+TLS is terminated *there* and this process only ever sees plain HTTP, so it
+cannot tell and leaves the flag off. `WK_SECURE_COOKIES=1` says "there is HTTPS
+in front of you" and puts it back. Without it, a visit over plain `http://`
+would send the session cookie in the clear.
 
-With `WK_DATABASE_URL` set, this app writes nothing to disk and the service needs
-no persistent disk — which also keeps the site's zero-downtime deploys, since a
-Render service with a disk gives those up.
-
-To move this app to its own service later, point `STAFF_ORIGIN` at it (e.g.
-`https://bookings.internal`) — the site proxies there instead and stops starting
-a local copy. Nothing else changes.
-
-### Updating from the standalone repo
-
-The code is vendored with `git subtree` from `TCS231107/WK-staff-booking`:
-
-```bash
-git subtree pull --prefix=staff git@github.com:TCS231107/WK-staff-booking.git main --squash
-```
-
-The mount-point changes here (`WK_BASE_PATH`, `WK_BIND`, `WK_SECURE_COOKIES`) are
-inert when those variables are unset, so the standalone install still behaves
-exactly as it always did and the two copies stay mergeable.
+**A note on scaling.** The app holds its data in memory and writes changes
+through to the database, so run **one instance**. Two instances would each have
+their own copy and quietly overwrite each other.
 
 ## Signing in
 
@@ -204,9 +179,11 @@ in `.env` (or the environment) before the first run.
 Set `WK_ADMIN_CONTACT` to an email address and it shows up on the sign-in screen
 as the "Contact your admin" link for access / password-reset help.
 
-- Accounts live in `data/users.json` (passwords are scrypt-hashed, never stored plain).
+- Accounts live in `data/users.json`, or the `wk.users` table on Postgres.
+  Passwords are scrypt-hashed, never stored plain.
 - Sessions are signed cookies (12 h, or 30 days with *Keep me signed in*); the
-  signing key is `data/.session-secret`.
+  signing key is `data/.session-secret`, or a row in `wk.state`. Either way it
+  outlives a restart, so nobody is logged out by a deploy.
 - Every `/api/*` call except the login endpoints requires a valid session.
 - Sign out / change your password from the avatar menu, top-right.
 
@@ -270,7 +247,8 @@ node server.js
 - Typing a brand-new client / role / delivery manager straight into a booking
   also adds it to the list automatically.
 
-Everything here lives in `data/config.json`.
+Everything here is stored as one config document — `data/config.json`, or the
+`config` row of `wk.state` on Postgres.
 
 ## Table view — works like a spreadsheet
 
@@ -283,16 +261,23 @@ Everything here lives in `data/config.json`.
 
 ## How it works
 
-| Piece | File |
-|---|---|
-| HTTP server + REST API + static hosting | `server.js` |
-| The app (UI, all in one file) | `public/index.html` |
-| Your bookings (created on first run) | `data/bookings.json` |
-| Field options — statuses, clients, roles, delivery managers | `data/config.json` |
-| User accounts (scrypt-hashed passwords) | `data/users.json` |
-| Automatic point-in-time snapshots | `data/backups/` |
-| Activity log (sign-ins, edits, invites…) | `data/audit.log` |
-| Smoke test | `test.js` |
+| Piece | Code | On files | On Postgres |
+|---|---|---|---|
+| HTTP server + REST API + static hosting | `server.js` | | |
+| The app (UI, all in one file) | `public/index.html` | | |
+| Postgres backend (schema, queries) | `store-pg.js` | — | |
+| Your bookings (created on first run) | | `data/bookings.json` | `wk.bookings` |
+| Field options — statuses, clients, roles, delivery managers | | `data/config.json` | `wk.state` |
+| User accounts (scrypt-hashed passwords) | | `data/users.json` | `wk.users` |
+| Automatic point-in-time snapshots | | `data/backups/` | `wk.backups` |
+| Activity log (sign-ins, edits, invites…) | | `data/audit.log` | `wk.audit` |
+| Avatars and invite previews | | `public/avatars/`, `public/invites/` | `wk.assets` |
+| Smoke tests | `test.js`, `test-pg.js` | | |
+| Move files into Postgres | `import-files.js` | | |
+
+The app reads everything into memory at boot and writes changes through to
+storage, so **run one instance**. Two would each hold their own copy and
+overwrite each other.
 | Configuration | `.env` (see `.env.example`) |
 
 The browser talks to a small JSON API:
@@ -320,9 +305,10 @@ PATCH  /api/team/:id          {role} / {status}  (admin)
 DELETE /api/team/:id          remove member (admin)
 ```
 
-Every change is written to `data/bookings.json`. Open the app in several tabs or
-on other machines on your network (`http://<your-ip>:4173`) — each tab refreshes
-from the server every 7 seconds, so edits show up for everyone.
+Every change is written straight through to storage. Open the app in several tabs
+or on other machines (`http://<your-ip>:4173` on a local network, or its public
+URL) — each tab refreshes from the server every 7 seconds, so edits show up for
+everyone.
 
 ## Booking fields
 
@@ -343,11 +329,23 @@ to `Risk` / `Exit` / `N/A` on server start.
 
 ## Reset / import data
 
+**On files:**
+
 - **Reset to the sample set:** stop the server, delete `data/bookings.json`, start again.
 - **Import your real data:** stop the server, replace `data/bookings.json` with an
   array of booking objects (same field names as above; `id` optional), start again.
 - **Restore a backup:** stop the server, copy a file out of `data/backups/` over
   the live one (drop the timestamp from the name), start again.
+
+**On Postgres:**
+
+- **Move an existing file install in:** `npm run import -- /path/to/data` — see
+  [Moving an existing file install into Postgres](#moving-an-existing-file-install-into-postgres).
+- **Reset to the sample set:** `delete from wk.bookings;` then restart the server;
+  it re-seeds when it finds the table empty.
+- **Restore a backup:** the snapshots are JSON documents in `wk.backups`, newest
+  first — `select payload from wk.backups where name = 'bookings' order by id desc limit 1;`
+  Write it back with `import-files.js`, or paste it over `wk.bookings` by hand.
 
 ## Not built yet
 
