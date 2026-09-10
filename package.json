@@ -6,9 +6,15 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:pg": "node test-pg.js",
+    "import": "node import-files.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "//": "pg is required only when WK_DATABASE_URL is set; on JSON files this app still installs nothing.",
+  "optionalDependencies": {
+    "pg": "^8.23.0"
   }
 }
