@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:pg": "node test-pg.js",
+    "import": "node import-files.js"
   },
   "engines": {
     "node": ">=18"

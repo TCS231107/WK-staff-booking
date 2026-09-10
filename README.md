@@ -122,10 +122,13 @@ exposes `public` through its REST API, where the publishable key would be enough
 to read the users table, and that table holds password hashes. Row-level
 security is switched on as a second lock.
 
+The connection string can also go in `.env` next to `server.js`, which is
+git-ignored — handy for not repeating a password on the command line.
+
 To check a connection string before trusting it to a deploy:
 
 ```bash
-WK_DATABASE_URL="postgresql://..." npm run staff:test:pg
+cd staff && WK_DATABASE_URL="postgresql://..." npm run test:pg
 ```
 
 That runs the full API against a throwaway `wk_test` schema, restarts the server
@@ -134,7 +137,7 @@ mid-test to prove the data is really in the database, and drops the schema after
 ### Moving an existing file install into Postgres
 
 ```bash
-WK_DATABASE_URL="postgresql://..." npm run staff:import -- /path/to/data
+cd staff && WK_DATABASE_URL="postgresql://..." npm run import -- /path/to/data
 ```
 
 Copies bookings, accounts (password hashes included, so everyone keeps their
