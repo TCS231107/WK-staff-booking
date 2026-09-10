@@ -33,6 +33,13 @@ const ROOT = __dirname;
 })();
 
 const PORT = process.env.PORT || 4173;
+// Mount point. Empty => the app owns the whole origin (standalone, as before).
+// Set WK_BASE_PATH=/staff to serve it under weknowinc.com/staff behind the
+// main Next.js site; the prefix is stripped from requests and pushed back into
+// every root-relative URL the app hands out (API calls, brand assets, avatars).
+const BASE_PATH = String(process.env.WK_BASE_PATH || '').replace(/\/+$/, '');
+// Bind address. 127.0.0.1 keeps the sidecar unreachable except through the proxy.
+const BIND = process.env.WK_BIND || '0.0.0.0';
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = process.env.WK_DATA_DIR ? path.resolve(process.env.WK_DATA_DIR) : path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'bookings.json');
@@ -51,7 +58,10 @@ function tlsOptions() {
   catch (e) { console.error('  TLS cert/key unreadable (' + e.message + ') - starting on HTTP instead.'); return null; }
 }
 const TLS_OPTS = tlsOptions();
-const SECURE_COOKIES = !!TLS_OPTS;
+// Behind a proxy that terminates TLS (Cloudflare -> Render) this process speaks
+// plain HTTP but the browser is on https, so the session cookie still needs
+// Secure. WK_SECURE_COOKIES=1 forces it on.
+const SECURE_COOKIES = !!TLS_OPTS || /^(1|true|yes)$/i.test(process.env.WK_SECURE_COOKIES || '');
 
 // --- point-in-time backups: snapshot a data file before it is overwritten ---
 const BACKUP_KEEP = 40;
@@ -410,7 +420,7 @@ function noteFailedLogin(ip) {
   e.count++; loginAttempts.set(ip, e);
 }
 
-const cookieFlags = '; HttpOnly; Path=/; SameSite=Lax' + (SECURE_COOKIES ? '; Secure' : '');
+const cookieFlags = '; HttpOnly; Path=' + (BASE_PATH || '/') + '; SameSite=Lax' + (SECURE_COOKIES ? '; Secure' : '');
 
 async function handleAuth(req, res, sub, ip) {
   if (sub === 'context' && req.method === 'GET') {
@@ -465,7 +475,7 @@ async function handleAuth(req, res, sub, ip) {
       const base = crypto.createHash('sha1').update(u.username).digest('hex').slice(0, 12);
       ['png', 'jpg', 'webp'].forEach((x) => { try { fs.unlinkSync(path.join(AVATAR_DIR, base + '.' + x)); } catch (e) {} });
       fs.writeFileSync(path.join(AVATAR_DIR, base + '.' + ext), buf);
-      u.avatar = '/avatars/' + base + '.' + ext + '?v=' + Date.now();
+      u.avatar = BASE_PATH + '/avatars/' + base + '.' + ext + '?v=' + Date.now();
       saveUsers();
       audit('auth.avatar_set', u.username, {});
       return sendJson(res, 200, { user: publicUser(u) });
@@ -733,6 +743,16 @@ const MIME = {
   '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.png': 'image/png', '.woff2': 'font/woff2'
 };
 
+// The single-page app addresses the server with root-relative URLs ("/api/...",
+// "/brand/..."). When the app is mounted under BASE_PATH those have to become
+// "/staff/api/..." etc., so rewrite them on the way out. No-op when BASE_PATH
+// is empty, which keeps the standalone install byte-identical.
+const REBASE_RE = /(["'`])\/(api|brand|avatars|invites)\//g;
+function rebaseHtml(buf) {
+  if (!BASE_PATH) return buf;
+  return Buffer.from(buf.toString('utf8').replace(REBASE_RE, '$1' + BASE_PATH + '/$2/'), 'utf8');
+}
+
 function serveStatic(req, res) {
   let rel = decodeURIComponent(req.url.split('?')[0]);
   if (rel === '/') rel = '/index.html';
@@ -740,8 +760,10 @@ function serveStatic(req, res) {
   if (!filePath.startsWith(PUBLIC_DIR)) { sendJson(res, 403, { error: 'forbidden' }); return; }
   fs.readFile(filePath, (err, buf) => {
     if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found'); return; }
+    const ext = path.extname(filePath);
+    if (ext === '.html') buf = rebaseHtml(buf);
     res.writeHead(200, {
-      'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream',
+      'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': 'no-store, must-revalidate'
     });
     res.end(buf);
@@ -987,7 +1009,19 @@ ensureData();
 db();
 ensureConfig();
 
+// Strip the mount prefix so every route below sees the paths it always saw.
+// Tolerates the proxy passing the prefix through ("/staff/api/x") or stripping
+// it itself ("/api/x"), and accepts "/staff" with or without a trailing slash.
+function stripBase(reqUrl) {
+  if (!BASE_PATH) return reqUrl;
+  if (reqUrl === BASE_PATH) return '/';
+  if (reqUrl.indexOf(BASE_PATH + '/') === 0) return reqUrl.slice(BASE_PATH.length) || '/';
+  if (reqUrl.indexOf(BASE_PATH + '?') === 0) return '/' + reqUrl.slice(BASE_PATH.length);
+  return reqUrl;
+}
+
 const requestHandler = (req, res) => {
+  req.url = stripBase(req.url);
   const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url).catch((e) => sendJson(res, 400, { error: String((e && e.message) || e) }));
@@ -998,10 +1032,11 @@ const requestHandler = (req, res) => {
 const server = TLS_OPTS ? https.createServer(TLS_OPTS, requestHandler) : http.createServer(requestHandler);
 const scheme = TLS_OPTS ? 'https' : 'http';
 
-server.listen(PORT, () => {
+server.listen(PORT, BIND, () => {
   console.log('\n  weKnow Staff Bookings');
   console.log('  ---------------------');
-  console.log('  Running at  ' + scheme + '://localhost:' + PORT + (TLS_OPTS ? '   (TLS)' : ''));
+  console.log('  Running at  ' + scheme + '://' + (BIND === '0.0.0.0' ? 'localhost' : BIND) + ':' + PORT + BASE_PATH + (TLS_OPTS ? '   (TLS)' : ''));
+  if (BASE_PATH) console.log('  Mounted at  ' + BASE_PATH + '   (behind the weknowinc.com Next.js site)');
   console.log('  Data dir    ' + DATA_DIR);
   console.log('  Backups     ' + BACKUP_DIR + '   (auto, keeps ' + BACKUP_KEEP + ')');
   console.log('  Activity    ' + AUDIT_FILE);
